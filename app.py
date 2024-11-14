@@ -24,6 +24,9 @@ def analyze_pdf(file_bytes):
             'forms': {}
         }
 
+        # Collect all mailto links
+        mailto_links = []
+
         for page_num in range(len(pdf)):
             page = pdf[page_num]
 
@@ -42,16 +45,22 @@ def analyze_pdf(file_bytes):
                     } for annot in annotations
                 ]
 
-            # Get links
+            # Get links and collect mailto links
             links = page.get_links()
             if links:
-                metadata['content']['links'][f'page_{page_num+1}'] = [
-                    {
+                metadata['content']['links'][f'page_{page_num+1}'] = []
+                for link in links:
+                    link_data = {
                         'type': link.get('type', ''),
                         'uri': link.get('uri', ''),
                         'destination': link.get('destination', '')
-                    } for link in links
-                ]
+                    }
+                    metadata['content']['links'][f'page_{page_num+1}'].append(
+                        link_data)
+
+                    # If it's a mailto link, add to sensitive data
+                    if link_data['uri'] and link_data['uri'].startswith('mailto:'):
+                        mailto_links.append(link_data['uri'])
 
             # Get form fields
             widgets = page.widgets()
@@ -80,6 +89,17 @@ def analyze_pdf(file_bytes):
 
         # Analyze all text for sensitive data
         metadata['sensitive_data'] = find_sensitive_patterns(full_text)
+
+        # Add mailto links to sensitive data if any were found
+        if mailto_links:
+            if 'emails_and_mailtos' not in metadata['sensitive_data']:
+                metadata['sensitive_data']['emails_and_mailtos'] = []
+            metadata['sensitive_data']['emails_and_mailtos'].extend(
+                mailto_links)
+            # Remove duplicates while preserving order
+            metadata['sensitive_data']['emails_and_mailtos'] = list(dict.fromkeys(
+                metadata['sensitive_data']['emails_and_mailtos']
+            ))
 
     return metadata
 
@@ -232,6 +252,68 @@ def find_sensitive_patterns(text):
     return results
 
 
+def analyze_security_concerns(metadata, file_type):
+    concerns = []
+
+    # Check emails
+    if 'sensitive_data' in metadata and 'emails_and_mailtos' in metadata['sensitive_data']:
+        emails = metadata['sensitive_data']['emails_and_mailtos']
+        if len(emails) > 1:
+            concerns.append({
+                'level': 'WARNING',
+                'message': f'Multiple email addresses found ({len(emails)})',
+                'details': emails
+            })
+
+        # Check for numbers in emails
+        emails_with_numbers = [email for email in emails if any(
+            char.isdigit() for char in email)]
+        if emails_with_numbers:
+            concerns.append({
+                'level': 'INFO',
+                'message': 'Emails containing numbers detected',
+                'details': emails_with_numbers
+            })
+
+    # Check software fingerprints in both DOCX and PDF
+    if file_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+        if 'file_metadata' in metadata:
+            app_info = str(metadata['file_metadata'].get(
+                'Application', '')).lower()
+            if 'wps' in app_info:
+                concerns.append({
+                    'level': 'WARNING',
+                    'message': 'Document created with WPS Office',
+                    'details': metadata['file_metadata'].get('Application', '')
+                })
+            if 'kendo' in app_info:
+                concerns.append({
+                    'level': 'WARNING',
+                    'message': 'Document contains Kendo UI traces',
+                    'details': metadata['file_metadata'].get('Application', '')
+                })
+    elif file_type == 'application/pdf':
+        if 'basic' in metadata:
+            # Check Creator and Producer fields
+            creator = str(metadata['basic'].get('creator', '')).lower()
+            producer = str(metadata['basic'].get('producer', '')).lower()
+
+            if 'wps' in creator or 'wps' in producer:
+                concerns.append({
+                    'level': 'WARNING',
+                    'message': 'Document created with WPS Office',
+                    'details': f"Creator: {metadata['basic'].get('creator', '')}, Producer: {metadata['basic'].get('producer', '')}"
+                })
+            if 'kendo' in creator or 'kendo' in producer:
+                concerns.append({
+                    'level': 'WARNING',
+                    'message': 'Document contains Kendo UI traces',
+                    'details': f"Creator: {metadata['basic'].get('creator', '')}, Producer: {metadata['basic'].get('producer', '')}"
+                })
+
+    return concerns
+
+
 st.title("Document Metadata Analyzer")
 
 uploaded_file = st.file_uploader(
@@ -249,8 +331,24 @@ if uploaded_file:
         if file_type == 'application/pdf':
             metadata = analyze_pdf(file_bytes)
 
+            concerns = analyze_security_concerns(metadata, file_type)
+            if concerns:
+                st.write("### ⚠️ Security Concerns")
+                for concern in concerns:
+                    if concern['level'] == 'WARNING':
+                        st.warning(
+                            f"**{concern['message']}**\n\n{concern['details']}")
+                    else:
+                        st.info(
+                            f"**{concern['message']}**\n\n{concern['details']}")
+
             st.write("### PDF Basic Metadata")
-            st.json(metadata.get('basic', {}))
+            # Highlight WPS or Kendo UI in metadata
+            for key, value in metadata.get('basic', {}).items():
+                if value and ('wps' in str(value).lower() or 'kendo' in str(value).lower()):
+                    st.warning(f"**{key}:** {value}")
+                else:
+                    st.write(f"**{key}:** {value}")
 
             if metadata.get('content'):
                 if metadata['content']['annotations']:
@@ -276,11 +374,26 @@ if uploaded_file:
         elif file_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
             metadata = analyze_docx(file_bytes)
 
+            # Analyze security concerns
+            concerns = analyze_security_concerns(metadata, file_type)
+            if concerns:
+                st.write("### ⚠️ Security Concerns")
+                for concern in concerns:
+                    if concern['level'] == 'WARNING':
+                        st.warning(
+                            f"**{concern['message']}**\n\n{concern['details']}")
+                    else:
+                        st.info(
+                            f"**{concern['message']}**\n\n{concern['details']}")
+
             st.write("### DOCX File Metadata")
             if metadata.get('file_metadata'):
-                # Display in a more organized way
+                # Highlight WPS or Kendo UI in metadata
                 for key, value in metadata['file_metadata'].items():
-                    st.write(f"**{key.replace('_', ' ')}:** {value}")
+                    if key == 'Application' and value and ('wps' in value.lower() or 'kendo' in value.lower()):
+                        st.warning(f"**{key.replace('_', ' ')}:** {value}")
+                    else:
+                        st.write(f"**{key.replace('_', ' ')}:** {value}")
 
             if metadata.get('statistics'):
                 st.write("### Document Statistics")
